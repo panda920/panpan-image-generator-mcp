@@ -1,0 +1,40 @@
+{
+  "name": "panpan-image-generator-mcp",
+  "version": "1.0.0",
+  "description": "MCP 服务器：支持多种 AI 图像生成模型（Gemini、智谱 GLM-Image、ByteDance Seedream）",
+  "type": "module",
+  "main": "panpan-image-generator-mcp-server.js",
+  "bin": {
+    "panpan-image-generator-mcp": "./panpan-image-generator-mcp-server.js"
+  },
+  "scripts": {
+    "start": "node panpan-image-generator-mcp-server.js",
+    "dev": "node --watch panpan-image-generator-mcp-server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "node-fetch": "^3.3.2",
+    "pdfkit": "^0.15.0",
+    "pptxgenjs": "^3.12.0",
+    "sharp": "^0.33.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "mcp",
+    "gemini",
+    "image-generation",
+    "ai",
+    "claude",
+    "openrouter",
+    "zhipu",
+    "seedream"
+  ],
+  "author": "panpan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/panpanzhilin/panpan-image-generator-mcp.git"
+  }
+}
