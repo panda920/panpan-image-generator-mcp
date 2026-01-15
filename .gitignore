@@ -8,10 +8,9 @@ node_modules/
 
 # 生成的图片
 generated-images/
-*.png
-*.jpg
-*.jpeg
-*.webp
+
+# 保留 assets 目录下的图片
+!assets/
 
 # 日志
 *.log
