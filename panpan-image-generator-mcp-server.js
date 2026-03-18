@@ -3,6 +3,11 @@
 /**
  * 自定义 Gemini MCP 服务器
  * 支持使用第三方 API 进行图像生成
+ * 支持模型：
+ *   - gemini-3-pro-image-preview      (nanobananapro，高质量)
+ *   - gemini-3-pro-image-preview-2k   (Pro 2K)
+ *   - gemini-3-pro-image-preview-4k   (Pro 4K)
+ *   - gemini-3.1-flash-image-preview  (nanobanana2，快速)
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -23,1300 +28,795 @@ import sharp from 'sharp';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// 配置 - 所有 API Key 必须通过环境变量提供
-const API_CONFIG = {
-  apiKey: process.env.GEMINI_API_KEY || "",
-  apiBase: process.env.GEMINI_API_BASE || "https://openrouter.ai/api/v1",
-  // 模型配置：
-  // - Nano Banana Pro (高质量): google/gemini-3-pro-image-preview (google-ai-studio 供应商)
-  // - Seedream (普通版/Flash): bytedance-seed/seedream-4.5
-  // - GLM-Image (智谱): glm-image
-  modelNanoBanana: process.env.GEMINI_MODEL || "google/gemini-3-pro-image-preview",
-  modelSeedream: "bytedance-seed/seedream-4.5",
-  modelGlmImage: "glm-image",
-  // 智谱 API 配置
-  zhipuApiKey: process.env.ZHIPU_API_KEY || "",
-  zhipuApiBase: "https://open.bigmodel.cn/api/paas/v4",
-  // 修复 URL 拼接问题：如果 API_BASE 已经包含 /v1，则不再添加
-  chatApiUrl: process.env.GEMINI_API_BASE
-    ? (process.env.GEMINI_API_BASE.endsWith('/v1')
-        ? `${process.env.GEMINI_API_BASE}/chat/completions`
-        : `${process.env.GEMINI_API_BASE}/v1/chat/completions`)
-    : "https://openrouter.ai/api/v1/chat/completions",
-  // 默认输出目录，但会优先使用项目路径
-  outputDir: process.env.OUTPUT_DIR || path.join(__dirname, 'generated-images'),
-  // 当前工作目录（项目路径）
-  projectDir: process.env.PROJECT_DIR || process.cwd()
+// ─── 模型注册表 ──────────────────────────────────────────────────────────────
+// key = 工具参数中使用的别名，value = 实际 API model id
+const MODEL_REGISTRY = {
+  'nanobananapro':              'gemini-3-pro-image-preview',
+  'nano-banana-pro':            'gemini-3-pro-image-preview',
+  'gemini-3-pro':               'gemini-3-pro-image-preview',
+  'gemini-3-pro-image-preview': 'gemini-3-pro-image-preview',
+
+  'gemini-3-pro-2k':                'gemini-3-pro-image-preview-2k',
+  'gemini-3-pro-image-preview-2k':  'gemini-3-pro-image-preview-2k',
+
+  'gemini-3-pro-4k':                'gemini-3-pro-image-preview-4k',
+  'gemini-3-pro-image-preview-4k':  'gemini-3-pro-image-preview-4k',
+
+  'nanobanana2':                        'gemini-3.1-flash-image-preview',
+  'gemini-flash':                       'gemini-3.1-flash-image-preview',
+  'gemini-3.1-flash':                   'gemini-3.1-flash-image-preview',
+  'gemini-3.1-flash-image-preview':     'gemini-3.1-flash-image-preview',
 };
 
-// 确保输出目录存在
-async function ensureOutputDir() {
+// 分辨率映射：image_size 参数 → prompt 中注入的分辨率描述
+const RESOLUTION_MAP = {
+  '1K':  '1024x576',
+  '2K':  '2048x1152',
+  '4K':  '3840x2160',
+  // 也支持直接传 WxH 格式，如 "1920x1080"
+};
+
+// 默认模型（可通过环境变量覆盖）
+const DEFAULT_MODEL_KEY = process.env.GEMINI_MODEL || 'gemini-3-pro-image-preview';
+const DEFAULT_FLASH_KEY = process.env.GEMINI_FLASH_MODEL || 'gemini-3.1-flash-image-preview';
+
+// ─── API 配置 ─────────────────────────────────────────────────────────────────
+const API_BASE_RAW = process.env.GEMINI_API_BASE || 'https://openrouter.ai/api/v1';
+const API_BASE = API_BASE_RAW.replace(/\/$/, ''); // 去掉末尾斜杠
+const CHAT_API_URL = API_BASE.endsWith('/v1')
+  ? `${API_BASE}/chat/completions`
+  : `${API_BASE}/v1/chat/completions`;
+
+const API_CONFIG = {
+  apiKey:           process.env.GEMINI_API_KEY || '',
+  apiBase:          API_BASE,
+  chatApiUrl:       CHAT_API_URL,
+  modelNanoBanana:  resolveModel(DEFAULT_MODEL_KEY),
+  modelGeminiFlash: resolveModel(DEFAULT_FLASH_KEY),
+  // 默认输出目录：优先用环境变量，否则用当前工作目录（即调用方的项目目录）
+  outputDir:        process.env.OUTPUT_DIR || process.cwd(),
+  // MCP 服务器自身目录，作为写入失败时的 fallback
+  fallbackDir:      path.join(__dirname, 'generated-images'),
+};
+
+/** 将别名/model id 解析为实际 API model id */
+function resolveModel(nameOrAlias) {
+  return MODEL_REGISTRY[nameOrAlias] || nameOrAlias;
+}
+
+/** 根据 image_size / resolution 参数构建分辨率描述字符串 */
+function buildResolutionHint(imageConfig) {
+  if (!imageConfig) return null;
+  const { image_size, resolution } = imageConfig;
+
+  // 优先使用 resolution（直接 WxH）
+  if (resolution && /^\d+x\d+$/i.test(resolution)) return resolution;
+
+  // 其次使用 image_size 枚举
+  if (image_size && RESOLUTION_MAP[image_size]) return RESOLUTION_MAP[image_size];
+
+  return null;
+}
+
+/** 将分辨率和宽高比信息注入 prompt */
+function buildEnhancedPrompt(prompt, imageConfig) {
+  if (!imageConfig) return prompt;
+
+  const parts = [];
+  const resHint = buildResolutionHint(imageConfig);
+  if (resHint) parts.push(`Resolution: ${resHint}`);
+  if (imageConfig.aspect_ratio) parts.push(`Aspect ratio: ${imageConfig.aspect_ratio}`);
+
+  if (parts.length === 0) return prompt;
+  return `[${parts.join(', ')}] ${prompt}`;
+}
+
+// ─── 工具函数 ─────────────────────────────────────────────────────────────────
+
+async function ensureDir(dir) {
   try {
-    await fs.access(API_CONFIG.outputDir);
+    await fs.access(dir);
   } catch {
-    await fs.mkdir(API_CONFIG.outputDir, { recursive: true });
+    await fs.mkdir(dir, { recursive: true });
   }
 }
 
-// 不再对提示词进行优化，让大模型自由发挥创意
+async function ensureOutputDir() {
+  await ensureDir(API_CONFIG.outputDir);
+}
 
-// 图像生成函数（使用对话式接口）
-// imageConfig: { aspect_ratio?: string, image_size?: '1K' | '2K' | '4K' }
+/** 生成默认文件名（不含目录） */
+function buildFilename(prompt) {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const safePrompt = prompt.substring(0, 30).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '_');
+  return `generated_${safePrompt}_${ts}.png`;
+}
+
+/**
+ * 将图片 buffer 写入文件，失败时自动 fallback 到 MCP 服务器目录。
+ * 返回最终写入的路径。
+ */
+async function saveImageBuffer(imageBuffer, saveToFilePath, prompt) {
+  // 有明确路径时直接写
+  if (saveToFilePath) {
+    const dir = path.dirname(saveToFilePath);
+    await ensureDir(dir);
+    await fs.writeFile(saveToFilePath, imageBuffer);
+    console.error(`[saveImage] 已保存到指定路径: ${saveToFilePath}`);
+    return saveToFilePath;
+  }
+
+  // 没有路径：尝试写入 outputDir（默认 = 当前工作目录）
+  const filename = buildFilename(prompt);
+  const primaryPath = path.join(API_CONFIG.outputDir, filename);
+  try {
+    await ensureDir(API_CONFIG.outputDir);
+    await fs.writeFile(primaryPath, imageBuffer);
+    console.error(`[saveImage] 已保存到默认目录: ${primaryPath}`);
+    return primaryPath;
+  } catch (err) {
+    // fallback：写入 MCP 服务器目录
+    console.error(`[saveImage] 写入默认目录失败 (${err.message})，fallback 到 MCP 目录`);
+    const fallbackPath = path.join(API_CONFIG.fallbackDir, filename);
+    await ensureDir(API_CONFIG.fallbackDir);
+    await fs.writeFile(fallbackPath, imageBuffer);
+    console.error(`[saveImage] 已 fallback 保存到: ${fallbackPath}`);
+    return fallbackPath;
+  }
+}
+
+/** 从 OpenAI 兼容 API 响应中提取图像 base64 数据 */
+function extractImageFromResponse(responseText) {
+  let imageBase64 = null;
+  let textContent = '';
+
+  try {
+    const jsonData = JSON.parse(responseText);
+    if (jsonData.choices && jsonData.choices[0] && jsonData.choices[0].message) {
+      const message = jsonData.choices[0].message;
+      const messageContent = message.content;
+
+      // message.images 数组
+      if (message.images && Array.isArray(message.images)) {
+        for (const img of message.images) {
+          if (img.type === 'image_url' && img.image_url && img.image_url.url) {
+            const m = img.image_url.url.match(/^data:image\/[^;]+;base64,(.+)$/);
+            if (m) imageBase64 = m[1];
+          }
+        }
+      }
+
+      if (Array.isArray(messageContent)) {
+        for (const part of messageContent) {
+          if (part.type === 'text') textContent += part.text || '';
+          else if (part.type === 'image' && part.inline_data) imageBase64 = part.inline_data.data;
+          else if (part.type === 'image_url' && part.image_url) {
+            const m = part.image_url.url.match(/^data:image\/[^;]+;base64,(.+)$/);
+            if (m) imageBase64 = m[1];
+          }
+        }
+      } else if (typeof messageContent === 'string') {
+        textContent = messageContent;
+      }
+    }
+  } catch (e) {
+    console.error(`JSON 解析失败: ${e.message}`);
+  }
+
+  // markdown 格式 base64
+  if (!imageBase64 && textContent) {
+    const m = textContent.match(/!\[.*?\]\((data:image\/[^;]+;base64,([A-Za-z0-9+/=\s]+))\)/s);
+    if (m) {
+      imageBase64 = m[2].replace(/\s/g, '');
+      console.error(`[extractImage] 从 markdown 提取图像，长度: ${imageBase64.length}`);
+    }
+  }
+
+  // data URI
+  if (!imageBase64 && textContent) {
+    const m = textContent.match(/data:image\/[^;]+;base64,([A-Za-z0-9+/=]+)/);
+    if (m) imageBase64 = m[1];
+  }
+
+  // 图片 URL
+  let imageUrl = null;
+  if (!imageBase64 && textContent) {
+    const m = textContent.match(/https?:\/\/[^\s)]+\.(jpg|jpeg|png|gif|webp)/i);
+    if (m) imageUrl = m[0];
+  }
+
+  return { imageBase64, imageUrl, textContent };
+}
+
+// ─── 核心生图函数 ─────────────────────────────────────────────────────────────
+
+/**
+ * 生成单张图片
+ * @param {string} prompt
+ * @param {string|null} saveToFilePath
+ * @param {string} model  - 可以是别名或实际 model id
+ * @param {object|null} imageConfig - { aspect_ratio?, image_size?, resolution? }
+ */
 async function generateImage(prompt, saveToFilePath = null, model = API_CONFIG.modelNanoBanana, imageConfig = null) {
-  try {
-    console.error(`生成图像...`);
-    
-    // 构建请求体
-    const requestBody = {
-      model: model,
-      messages: [
-        {
-          role: "user",
-          content: prompt
-        }
-      ],
-      modalities: ["image", "text"],
-      stream: false,
-      max_tokens: 4000
-    };
-    
-    // 如果是 Gemini 模型，添加 image_config（默认 1K，加快生成速度）
-    if (model.includes('gemini') || model.includes('nano-banana')) {
-      requestBody.image_config = imageConfig || { image_size: '1K' };
-          }
-    
-    const response = await fetch(API_CONFIG.chatApiUrl, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${API_CONFIG.apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(requestBody)
-    });
+  const resolvedModel = resolveModel(model);
+  console.error(`[generateImage] 模型: ${resolvedModel}`);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`API 请求失败: ${response.status} - ${errorText}`);
-    }
+  const enhancedPrompt = buildEnhancedPrompt(prompt, imageConfig);
 
-    // 处理响应
-    const responseText = await response.text();
-    
-    let imageUrl = null;
-    let fullContent = '';
-    let imageBase64 = null;
-    
-    // 首先尝试解析为标准 JSON 响应（OpenRouter 格式）
-    try {
-      const jsonData = JSON.parse(responseText);
-            
-      if (jsonData.choices && jsonData.choices[0] && jsonData.choices[0].message) {
-        const message = jsonData.choices[0].message;
-        const messageContent = message.content;
-        
-        // OpenRouter 图像生成模型返回的图像在 message.images 字段中
-        if (message.images && Array.isArray(message.images)) {
-          for (const img of message.images) {
-            if (img.type === 'image_url' && img.image_url && img.image_url.url) {
-              const dataUrl = img.image_url.url;
-              // 解析 data:image/png;base64,... 格式
-              const base64Match = dataUrl.match(/^data:image\/[^;]+;base64,(.+)$/);
-              if (base64Match) {
-                imageBase64 = base64Match[1];
-                              }
-            }
-          }
-        }
-        
-        // OpenRouter 返回的 content 可能是数组（包含文本和图像）
-        if (!imageBase64 && Array.isArray(messageContent)) {
-          for (const part of messageContent) {
-            if (part.type === 'text') {
-              fullContent += part.text || '';
-            } else if (part.type === 'image' && part.inline_data) {
-              // OpenRouter 图像生成返回的格式
-              imageBase64 = part.inline_data.data;
-              console.error(`找到 inline_data 图像，mime_type: ${part.inline_data.mime_type}, 长度: ${imageBase64.length}`);
-            }
-          }
-        } else if (typeof messageContent === 'string') {
-          fullContent = messageContent;
-        }
-      }
-    } catch (e) {
-      console.error(`JSON 解析失败，尝试流式解析: ${e.message}`);
-      
-      // 回退到流式响应解析
-      const lines = responseText.split('\n').filter(line => line.trim());
-      console.error(`总行数: ${lines.length}`);
-      
-      for (const line of lines) {
-        try {
-          if (line.trim().startsWith('data:')) {
-            const jsonStr = line.replace('data: ', '');
-            if (jsonStr.trim() === '[DONE]') {
-              continue;
-            }
-            
-            const data = JSON.parse(jsonStr);
-            if (data.choices && data.choices[0]) {
-              const choice = data.choices[0];
-              
-              // 处理 delta 格式（流式）
-              if (choice.delta && choice.delta.content) {
-                const content = choice.delta.content;
-                if (Array.isArray(content)) {
-                  for (const part of content) {
-                    if (part.type === 'text') {
-                      fullContent += part.text || '';
-                    } else if (part.type === 'image' && part.inline_data) {
-                      imageBase64 = part.inline_data.data;
-                      console.error(`找到流式 inline_data 图像，长度: ${imageBase64.length}`);
-                    }
-                  }
-                } else if (typeof content === 'string') {
-                  fullContent += content;
-                }
-              }
-              
-              // 处理 message 格式（非流式）
-              if (choice.message && choice.message.content) {
-                const content = choice.message.content;
-                if (Array.isArray(content)) {
-                  for (const part of content) {
-                    if (part.type === 'text') {
-                      fullContent += part.text || '';
-                    } else if (part.type === 'image' && part.inline_data) {
-                      imageBase64 = part.inline_data.data;
-                      console.error(`找到 message inline_data 图像，长度: ${imageBase64.length}`);
-                    }
-                  }
-                } else if (typeof content === 'string') {
-                  fullContent += content;
-                }
-              }
-            }
-          }
-        } catch (parseErr) {
-          console.error(`解析行时出错: ${parseErr.message}`);
-          continue;
-        }
-      }
-    }
-    
-    console.error(`完整内容长度: ${fullContent.length}`);
-    console.error(`找到 base64 图像: ${imageBase64 ? '是' : '否'}`);
-    
-    // 如果没有找到 inline_data，尝试从文本内容中查找
-    if (!imageUrl && !imageBase64) {
-      const fullUrlMatch = fullContent.match(/https?:\/\/[^\s\)]+\.(jpg|jpeg|png|gif|webp)/i);
-      if (fullUrlMatch) {
-        imageUrl = fullUrlMatch[0];
-        console.error(`从完整内容中找到图像URL: ${imageUrl}`);
-      }
-      
-      const fullBase64Match = fullContent.match(/data:image\/[^;]+;base64,([A-Za-z0-9+/=]+)/);
-      if (fullBase64Match) {
-        imageBase64 = fullBase64Match[1];
-        console.error(`从完整内容中找到base64图像数据，长度: ${imageBase64.length}`);
-      }
-    }
-    
-    let imageBuffer;
-    
-    if (imageBase64) {
-      // 直接从base64解码图像
-      console.error('从响应中找到 base64 图像数据');
-      imageBuffer = Buffer.from(imageBase64, 'base64');
-    } else if (imageUrl) {
-      // 从URL下载图像
-      console.error(`获取到图像 URL: ${imageUrl}`);
-      const imageResponse = await fetch(imageUrl);
-      if (!imageResponse.ok) {
-        throw new Error(`下载图像失败: ${imageResponse.status}`);
-      }
-      imageBuffer = await imageResponse.buffer();
-    } else {
-      throw new Error('未在响应中找到图像URL或base64数据，可能需要调整提示词');
-    }
-    
-    // 如果没有指定保存路径，生成默认路径（优先使用项目路径）
-    if (!saveToFilePath) {
-      // 优先使用项目路径，如果没有则使用默认输出目录
-      const targetDir = API_CONFIG.projectDir || API_CONFIG.outputDir;
-      try {
-        await fs.access(targetDir);
-      } catch {
-        await fs.mkdir(targetDir, { recursive: true });
-      }
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const safePrompt = prompt.substring(0, 30).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '_');
-      // 根据响应类型确定扩展名
-      const ext = imageBase64 && responseText.includes('image/jpeg') ? 'jpg' : 'png';
-      saveToFilePath = path.join(targetDir, `generated_${safePrompt}_${timestamp}.${ext}`);
-    }
-
-    // 保存图像
-    await fs.writeFile(saveToFilePath, imageBuffer);
-    console.error(`图像已保存到: ${saveToFilePath}`);
-
-    return {
-      success: true,
-      message: `图像生成成功并保存到: ${saveToFilePath}`,
-      filePath: saveToFilePath,
-      prompt: prompt
-    };
-
-  } catch (error) {
-    console.error('图像生成失败:', error);
-    return {
-      success: false,
-      error: error.message,
-      prompt: prompt
-    };
-  }
-}
-
-// 智谱 GLM-Image 图像生成函数
-async function generateImageGlm(prompt, saveToFilePath = null, size = "1280x1280") {
-  try {
-    console.error(`[GLM-Image] 生成图像，提示词: ${prompt}`);
-
-    const response = await fetch(`${API_CONFIG.zhipuApiBase}/images/generations`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${API_CONFIG.zhipuApiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: API_CONFIG.modelGlmImage,
-        prompt: prompt,
-        size: size,
-        watermark_enabled: false  // 关闭水印
-      })
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`智谱 API 请求失败: ${response.status} - ${errorText}`);
-    }
-
-    const data = await response.json();
-    console.error(`[GLM-Image] API 响应:`, JSON.stringify(data, null, 2));
-    
-    // 智谱返回格式: { data: [{ url: "..." }] }
-    if (!data.data || !data.data[0] || !data.data[0].url) {
-      throw new Error('智谱 API 返回格式异常，未找到图像 URL');
-    }
-    
-    const imageUrl = data.data[0].url;
-    console.error(`[GLM-Image] 获取到图像 URL: ${imageUrl}`);
-    
-    // 下载图像
-    const imageResponse = await fetch(imageUrl);
-    if (!imageResponse.ok) {
-      throw new Error(`下载图像失败: ${imageResponse.status}`);
-    }
-    const imageBuffer = await imageResponse.buffer();
-    
-    // 如果没有指定保存路径，生成默认路径
-    if (!saveToFilePath) {
-      const targetDir = API_CONFIG.projectDir || API_CONFIG.outputDir;
-      try {
-        await fs.access(targetDir);
-      } catch {
-        await fs.mkdir(targetDir, { recursive: true });
-      }
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const safePrompt = prompt.substring(0, 30).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '_');
-      saveToFilePath = path.join(targetDir, `glm_${safePrompt}_${timestamp}.png`);
-    }
-
-    // 保存图像
-    await fs.writeFile(saveToFilePath, imageBuffer);
-    console.error(`[GLM-Image] 图像已保存到: ${saveToFilePath}`);
-
-    return {
-      success: true,
-      message: `图像生成成功并保存到: ${saveToFilePath}`,
-      filePath: saveToFilePath,
-      prompt: prompt,
-      model: 'glm-image'
-    };
-
-  } catch (error) {
-    console.error('[GLM-Image] 图像生成失败:', error);
-    return {
-      success: false,
-      error: error.message,
-      prompt: prompt,
-      model: 'glm-image'
-    };
-  }
-}
-
-// 智谱 GLM-Image 批量生成
-async function generateImageGlmBatch(batchRequests = [], concurrency = 3, size = "1024x1024") {
-  if (!Array.isArray(batchRequests) || batchRequests.length === 0) {
-    throw new Error('缺少批量请求列表，需提供 [{ prompt, saveToFilePath? }, ...]');
-  }
-
-  const results = [];
-  const queue = batchRequests.slice();
-  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
-    while (queue.length) {
-      const { prompt, saveToFilePath } = queue.shift();
-      try {
-        if (!prompt) {
-          results.push({ success: false, error: '缺少 prompt', prompt });
-          continue;
-        }
-        const result = await generateImageGlm(prompt, saveToFilePath, size);
-        results.push(result);
-      } catch (error) {
-        results.push({
-          success: false,
-          error: error.message || String(error),
-          prompt,
-          model: 'glm-image'
-        });
-      }
-    }
-  });
-
-  await Promise.all(workers);
-  return results;
-}
-
-// 批量生成图像，支持并发执行
-// imageConfig: { aspect_ratio?: string, image_size?: '1K' | '2K' | '4K' }
-async function generateImageBatch(batchRequests = [], concurrency = 3, model = API_CONFIG.modelNanoBanana, imageConfig = null) {
-  if (!Array.isArray(batchRequests) || batchRequests.length === 0) {
-    throw new Error('缺少批量请求列表，需提供 [{ prompt, saveToFilePath? }, ...]');
-  }
-
-  // 控制并发数量
-  const results = [];
-  const queue = batchRequests.slice();
-  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
-    while (queue.length) {
-      const { prompt, saveToFilePath } = queue.shift();
-      try {
-        if (!prompt) {
-          results.push({ success: false, error: '缺少 prompt', prompt });
-          continue;
-        }
-        const result = await generateImage(prompt, saveToFilePath, model, imageConfig);
-        results.push(result);
-      } catch (error) {
-        results.push({
-          success: false,
-          error: error.message || String(error),
-          prompt
-        });
-      }
-    }
-  });
-
-  await Promise.all(workers);
-  return results;
-}
-
-// 图像编辑函数（基于现有图像进行编辑）
-// imageConfig: { aspect_ratio?: string, image_size?: '1K' | '2K' | '4K' }
-async function editImage(imagePath, editPrompt, saveToFilePath = null, model = API_CONFIG.modelNanoBanana, imageConfig = null) {
-  try {
-    console.error(`编辑图像...`);
-    
-    // 读取原始图像
-    const imageBuffer = await fs.readFile(imagePath);
-    const base64Image = imageBuffer.toString('base64');
-
-    // 构建请求体
-    const requestBody = {
-      model: model,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: editPrompt
-            },
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:image/jpeg;base64,${base64Image}`
-              }
-            }
-          ]
-        }
-      ],
-      modalities: ["image", "text"],
-      stream: false,
-      max_tokens: 4000
-    };
-    
-    // 如果是 Gemini 模型，添加 image_config（默认 1K，加快生成速度）
-    if (model.includes('gemini') || model.includes('nano-banana')) {
-      requestBody.image_config = imageConfig || { image_size: '1K' };
-          }
-
-    const response = await fetch(API_CONFIG.chatApiUrl, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${API_CONFIG.apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(requestBody)
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`API 请求失败: ${response.status} - ${errorText}`);
-    }
-
-    // 处理响应
-    const responseText = await response.text();
-    
-    let imageUrl = null;
-    let fullContent = '';
-    let imageBase64 = null;
-    
-    // 首先尝试解析为标准 JSON 响应（OpenRouter 格式）
-    try {
-      const jsonData = JSON.parse(responseText);
-            
-      if (jsonData.choices && jsonData.choices[0] && jsonData.choices[0].message) {
-        const message = jsonData.choices[0].message;
-        const messageContent = message.content;
-        
-        // OpenRouter 图像生成模型返回的图像在 message.images 字段中
-        if (message.images && Array.isArray(message.images)) {
-          for (const img of message.images) {
-            if (img.type === 'image_url' && img.image_url && img.image_url.url) {
-              const dataUrl = img.image_url.url;
-              const base64Match = dataUrl.match(/^data:image\/[^;]+;base64,(.+)$/);
-              if (base64Match) {
-                imageBase64 = base64Match[1];
-                              }
-            }
-          }
-        }
-        
-        // OpenRouter 返回的 content 可能是数组
-        if (!imageBase64 && Array.isArray(messageContent)) {
-          for (const part of messageContent) {
-            if (part.type === 'text') {
-              fullContent += part.text || '';
-            } else if (part.type === 'image' && part.inline_data) {
-              imageBase64 = part.inline_data.data;
-                          }
-          }
-        } else if (typeof messageContent === 'string') {
-          fullContent = messageContent;
-        }
-      }
-    } catch (e) {
-      console.error(`JSON 解析失败: ${e.message}`);
-    }
-    
-    // 如果没有找到图像，尝试从文本内容中查找
-    if (!imageUrl && !imageBase64 && fullContent) {
-      const fullUrlMatch = fullContent.match(/https?:\/\/[^\s\)]+\.(jpg|jpeg|png|gif|webp)/i);
-      if (fullUrlMatch) {
-        imageUrl = fullUrlMatch[0];
-              }
-      
-      const fullBase64Match = fullContent.match(/data:image\/[^;]+;base64,([A-Za-z0-9+/=]+)/);
-      if (fullBase64Match) {
-        imageBase64 = fullBase64Match[1];
-              }
-    }
-    
-    let editedImageBuffer;
-    
-    if (imageBase64) {
-      // 直接从base64解码图像
-            editedImageBuffer = Buffer.from(imageBase64, 'base64');
-    } else if (imageUrl) {
-      // 从URL下载图像
-      console.error(`获取到编辑后图像 URL: ${imageUrl}`);
-      const imageResponse = await fetch(imageUrl);
-      if (!imageResponse.ok) {
-        throw new Error(`下载图像失败: ${imageResponse.status}`);
-      }
-      editedImageBuffer = await imageResponse.buffer();
-    } else {
-      throw new Error('未在编辑响应中找到图像URL或base64数据，可能需要调整编辑提示词');
-    }
-    
-    // 如果没有指定保存路径，生成默认路径
-    if (!saveToFilePath) {
-      await ensureOutputDir();
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const safePrompt = editPrompt.substring(0, 30).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '_');
-      saveToFilePath = path.join(API_CONFIG.outputDir, `edited_${safePrompt}_${timestamp}.png`);
-    }
-
-    // 保存编辑后的图像
-    await fs.writeFile(saveToFilePath, editedImageBuffer);
-    console.error(`编辑完成: ${saveToFilePath}`);
-
-    return {
-      success: true,
-      message: `图像编辑成功并保存到: ${saveToFilePath}`,
-      filePath: saveToFilePath,
-      originalPath: imagePath,
-      editPrompt: editPrompt
-    };
-
-  } catch (error) {
-    console.error('图像编辑失败:', error);
-    return {
-      success: false,
-      error: error.message,
-      originalPath: imagePath,
-      editPrompt: editPrompt
-    };
-  }
-}
-
-// 图片转 PDF 函数（PPT 风格，每页一张图片，完美填充无空白）
-async function imagesToPdf(imagePaths, outputPath, options = {}) {
-  try {
-    console.error(`转换 ${imagePaths.length} 张图片为 PDF...`);
-    
-    const { 
-      maxWidth = 1920,   // 最大宽度（用于缩放超大图片）
-      maxHeight = 1080   // 最大高度
-    } = options;
-    
-    // 创建 PDF 文档（不预设页面尺寸，每页根据图片尺寸动态设置）
-    const doc = new PDFDocument({
-      autoFirstPage: false,
-      margin: 0
-    });
-    
-    // 创建写入流
-    const { createWriteStream } = await import('fs');
-    const writeStream = createWriteStream(outputPath);
-    doc.pipe(writeStream);
-    
-    for (let i = 0; i < imagePaths.length; i++) {
-      const imagePath = imagePaths[i];
-      console.error(`处理图片 ${i + 1}/${imagePaths.length}: ${imagePath}`);
-      
-      // 读取图片并获取尺寸
-      const imageBuffer = await fs.readFile(imagePath);
-      const metadata = await sharp(imageBuffer).metadata();
-      
-      // 计算页面尺寸（完全匹配图片比例，无空白）
-      let pageWidth = metadata.width;
-      let pageHeight = metadata.height;
-      
-      // 如果图片太大，按比例缩小到合理尺寸
-      if (pageWidth > maxWidth || pageHeight > maxHeight) {
-        const scale = Math.min(maxWidth / pageWidth, maxHeight / pageHeight);
-        pageWidth = Math.round(pageWidth * scale);
-        pageHeight = Math.round(pageHeight * scale);
-      }
-      
-      // 添加新页面（尺寸完全匹配图片）
-      doc.addPage({
-        size: [pageWidth, pageHeight],
-        margin: 0
-      });
-      
-      // 图片填满整个页面，无空白
-      doc.image(imageBuffer, 0, 0, {
-        width: pageWidth,
-        height: pageHeight
-      });
-    }
-    
-    // 完成 PDF
-    doc.end();
-    
-    // 等待写入完成
-    await new Promise((resolve, reject) => {
-      writeStream.on('finish', resolve);
-      writeStream.on('error', reject);
-    });
-    
-    console.error(`PDF 已保存: ${outputPath}`);
-    
-    return {
-      success: true,
-      message: `成功将 ${imagePaths.length} 张图片转换为 PDF（无空白，完美填充）`,
-      filePath: outputPath,
-      pageCount: imagePaths.length
-    };
-    
-  } catch (error) {
-    console.error('图片转 PDF 失败:', error);
-    return {
-      success: false,
-      error: error.message
-    };
-  }
-}
-
-// 图片转 PPTX 函数
-async function imagesToPptx(imagePaths, outputPath) {
-  try {
-    console.error(`转换 ${imagePaths.length} 张图片为 PPTX...`);
-    
-    // 动态导入 pptxgenjs
-    const PptxGenJS = (await import('pptxgenjs')).default;
-    const pptx = new PptxGenJS();
-    
-    // 设置 PPT 属性
-    pptx.author = 'PanPan Image Generator';
-    pptx.title = 'Generated Presentation';
-    pptx.subject = 'Images to PPT';
-    
-    for (let i = 0; i < imagePaths.length; i++) {
-      const imagePath = imagePaths[i];
-      console.error(`处理图片 ${i + 1}/${imagePaths.length}: ${imagePath}`);
-      
-      // 读取图片
-      const imageBuffer = await fs.readFile(imagePath);
-      const metadata = await sharp(imageBuffer).metadata();
-      const base64Image = imageBuffer.toString('base64');
-      
-      // 计算图片比例
-      const imgAspect = metadata.width / metadata.height;
-      
-      // 根据图片比例设置幻灯片尺寸（16:9 或 4:3 或自定义）
-      if (imgAspect > 1.5) {
-        // 宽屏 16:9
-        pptx.defineLayout({ name: 'CUSTOM', width: 13.33, height: 7.5 });
-      } else if (imgAspect < 0.67) {
-        // 竖版 9:16
-        pptx.defineLayout({ name: 'CUSTOM', width: 7.5, height: 13.33 });
-      } else {
-        // 标准 4:3
-        pptx.defineLayout({ name: 'CUSTOM', width: 10, height: 7.5 });
-      }
-      pptx.layout = 'CUSTOM';
-      
-      // 添加幻灯片
-      const slide = pptx.addSlide();
-      
-      // 获取幻灯片尺寸
-      const slideWidth = pptx.presLayout.width;
-      const slideHeight = pptx.presLayout.height;
-      
-      // 计算图片尺寸（填满幻灯片）
-      let imgWidth, imgHeight, imgX, imgY;
-      const slideAspect = slideWidth / slideHeight;
-      
-      if (imgAspect > slideAspect) {
-        // 图片更宽，以高度为准填满
-        imgHeight = slideHeight;
-        imgWidth = imgHeight * imgAspect;
-        imgX = (slideWidth - imgWidth) / 2;
-        imgY = 0;
-      } else {
-        // 图片更高，以宽度为准填满
-        imgWidth = slideWidth;
-        imgHeight = imgWidth / imgAspect;
-        imgX = 0;
-        imgY = (slideHeight - imgHeight) / 2;
-      }
-      
-      // 确定图片类型
-      const ext = path.extname(imagePath).toLowerCase().replace('.', '') || 'png';
-      const mimeType = ext === 'jpg' ? 'jpeg' : ext;
-      
-      // 添加图片到幻灯片（填满整个幻灯片）
-      slide.addImage({
-        data: `data:image/${mimeType};base64,${base64Image}`,
-        x: 0,
-        y: 0,
-        w: '100%',
-        h: '100%',
-        sizing: { type: 'cover', w: '100%', h: '100%' }
-      });
-    }
-    
-    // 保存 PPTX
-    await pptx.writeFile({ fileName: outputPath });
-    
-    console.error(`PPTX 已保存: ${outputPath}`);
-    
-    return {
-      success: true,
-      message: `成功将 ${imagePaths.length} 张图片转换为 PPTX`,
-      filePath: outputPath,
-      slideCount: imagePaths.length
-    };
-    
-  } catch (error) {
-    console.error('图片转 PPTX 失败:', error);
-    return {
-      success: false,
-      error: error.message
-    };
-  }
-}
-
-// 创建服务器
-const server = new Server(
-  {
-    name: 'custom-gemini-mcp',
-    version: '1.0.0',
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
-
-// 注册初始化处理器
-server.setRequestHandler(InitializeRequestSchema, async (request) => {
-  console.error('收到初始化请求:', JSON.stringify(request, null, 2));
-
-  const response = {
-    protocolVersion: "2024-11-05",
-    capabilities: {
-      tools: {},
-    },
-    serverInfo: {
-      name: "custom-gemini-mcp",
-      version: "1.0.0",
-    },
+  const requestBody = {
+    model: resolvedModel,
+    messages: [{ role: 'user', content: enhancedPrompt }],
+    max_tokens: 4096,
   };
 
-  console.error('发送初始化响应:', JSON.stringify(response, null, 2));
-  return response;
-});
+  const response = await fetch(API_CONFIG.chatApiUrl, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${API_CONFIG.apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(requestBody),
+  });
 
-// 注册初始化完成通知处理器
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`API 请求失败: ${response.status} - ${errorText}`);
+  }
+
+  const responseText = await response.text();
+  const { imageBase64, imageUrl } = extractImageFromResponse(responseText);
+
+  let imageBuffer;
+  if (imageBase64) {
+    imageBuffer = Buffer.from(imageBase64, 'base64');
+  } else if (imageUrl) {
+    const imgRes = await fetch(imageUrl);
+    if (!imgRes.ok) throw new Error(`下载图像失败: ${imgRes.status}`);
+    imageBuffer = await imgRes.buffer();
+  } else {
+    throw new Error('未在响应中找到图像数据，可能需要调整提示词');
+  }
+
+  const finalPath = await saveImageBuffer(imageBuffer, saveToFilePath, prompt);
+  return { success: true, message: `图像生成成功: ${finalPath}`, filePath: finalPath, prompt };
+}
+
+/** 批量生图（高并发 worker pool） */
+async function generateImageBatch(batchRequests = [], concurrency = 10, model = API_CONFIG.modelNanoBanana, imageConfig = null) {
+  if (!Array.isArray(batchRequests) || batchRequests.length === 0) {
+    throw new Error('缺少批量请求列表');
+  }
+
+  const results = [];
+  const queue = batchRequests.slice();
+
+  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+    while (queue.length) {
+      const { prompt, saveToFilePath } = queue.shift();
+      if (!prompt) { results.push({ success: false, error: '缺少 prompt', prompt }); continue; }
+      try {
+        results.push(await generateImage(prompt, saveToFilePath, model, imageConfig));
+      } catch (e) {
+        results.push({ success: false, error: e.message, prompt });
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
+}
+
+/** 共享上下文批量生图 */
+async function generateImageWithSharedContext(styleContext, batchRequests = [], concurrency = 10, model = API_CONFIG.modelNanoBanana, imageConfig = null) {
+  if (!Array.isArray(batchRequests) || batchRequests.length === 0) {
+    throw new Error('缺少批量请求列表');
+  }
+
+  console.error(`[共享上下文] 开始 ${batchRequests.length} 个请求，并发: ${concurrency}`);
+
+  const results = [];
+  const queue = batchRequests.slice();
+
+  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+    while (queue.length) {
+      const request = queue.shift();
+      const { prompt, saveToFilePath, pageNumber } = request;
+      if (!prompt) { results.push({ success: false, error: '缺少 prompt', prompt, pageNumber }); continue; }
+
+      const enhancedPrompt = styleContext
+        ? `${styleContext}\n\n---\n\n【当前页面】第 ${pageNumber || '?'} 页\n${prompt}`
+        : prompt;
+
+      try {
+        const result = await generateImage(enhancedPrompt, saveToFilePath, model, imageConfig);
+        results.push({ ...result, pageNumber });
+      } catch (e) {
+        results.push({ success: false, error: e.message, prompt, pageNumber });
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  results.sort((a, b) => (a.pageNumber || 0) - (b.pageNumber || 0));
+  return results;
+}
+
+/** 图像编辑（支持多图参考） */
+async function editImage(imagePath, editPrompt, saveToFilePath = null, model = API_CONFIG.modelNanoBanana, imageConfig = null, referenceImages = []) {
+  const resolvedModel = resolveModel(model);
+  console.error(`[editImage] 模型: ${resolvedModel}`);
+
+  const imageBuffer = await fs.readFile(imagePath);
+  const metadata = await sharp(imageBuffer).metadata();
+  const originalRatio = metadata.width / metadata.height;
+
+  // 自动检测宽高比
+  const standardRatios = [
+    { ratio: 1, name: '1:1' }, { ratio: 2/3, name: '2:3' }, { ratio: 3/2, name: '3:2' },
+    { ratio: 3/4, name: '3:4' }, { ratio: 4/3, name: '4:3' }, { ratio: 4/5, name: '4:5' },
+    { ratio: 5/4, name: '5:4' }, { ratio: 9/16, name: '9:16' }, { ratio: 16/9, name: '16:9' },
+    { ratio: 21/9, name: '21:9' }
+  ];
+  let closestRatio = standardRatios.reduce((best, sr) =>
+    Math.abs(originalRatio - sr.ratio) < Math.abs(originalRatio - best.ratio) ? sr : best
+  );
+
+  if (!imageConfig) imageConfig = {};
+  if (!imageConfig.aspect_ratio) imageConfig.aspect_ratio = closestRatio.name;
+
+  const enhancedPrompt = buildEnhancedPrompt(`${editPrompt}\n\n保持原图其他所有元素不变。`, imageConfig);
+
+  const contentArray = [
+    { type: 'text', text: enhancedPrompt },
+    { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBuffer.toString('base64')}` } }
+  ];
+
+  for (const refPath of referenceImages) {
+    try {
+      const refBuf = await fs.readFile(refPath);
+      contentArray.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${refBuf.toString('base64')}` } });
+    } catch (err) {
+      console.error(`读取参考图失败: ${refPath} - ${err.message}`);
+    }
+  }
+
+  const response = await fetch(API_CONFIG.chatApiUrl, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${API_CONFIG.apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ model: resolvedModel, messages: [{ role: 'user', content: contentArray }], max_tokens: 4096 }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`API 请求失败: ${response.status} - ${errorText}`);
+  }
+
+  const responseText = await response.text();
+  const { imageBase64, imageUrl } = extractImageFromResponse(responseText);
+
+  let editedBuffer;
+  if (imageBase64) {
+    editedBuffer = Buffer.from(imageBase64, 'base64');
+  } else if (imageUrl) {
+    const imgRes = await fetch(imageUrl);
+    if (!imgRes.ok) throw new Error(`下载图像失败: ${imgRes.status}`);
+    editedBuffer = await imgRes.buffer();
+  } else {
+    throw new Error('未在编辑响应中找到图像数据');
+  }
+
+  // 编辑图片默认文件名加 edited_ 前缀
+  let editSavePath = saveToFilePath;
+  if (!editSavePath) {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const safePrompt = editPrompt.substring(0, 30).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '_');
+    editSavePath = `edited_${safePrompt}_${ts}.png`;
+    // 传 null 让 saveImageBuffer 自动拼目录，但我们需要带前缀的文件名
+    // 所以先构造完整路径再传入
+    editSavePath = path.join(API_CONFIG.outputDir, editSavePath);
+  }
+
+  const finalPath = await saveImageBuffer(editedBuffer, editSavePath, editPrompt);
+  return { success: true, message: `图像编辑成功: ${finalPath}`, filePath: finalPath, originalPath: imagePath, editPrompt };
+}
+
+/** 批量编辑图像 */
+async function editImageBatch(batchRequests = [], concurrency = 10, model = API_CONFIG.modelNanoBanana, imageConfig = null) {
+  if (!Array.isArray(batchRequests) || batchRequests.length === 0) {
+    throw new Error('缺少批量请求列表');
+  }
+
+  const results = [];
+  const queue = batchRequests.slice();
+
+  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+    while (queue.length) {
+      const req = queue.shift();
+      const { imagePath, editPrompt, saveToFilePath, referenceImages } = req;
+      if (!imagePath || !editPrompt) { results.push({ success: false, error: '缺少 imagePath 或 editPrompt', req }); continue; }
+      try {
+        results.push(await editImage(imagePath, editPrompt, saveToFilePath, model, imageConfig, referenceImages || []));
+      } catch (e) {
+        results.push({ success: false, error: e.message, imagePath, editPrompt });
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
+}
+
+// ─── PDF / PPTX ───────────────────────────────────────────────────────────────
+
+async function imagesToPdf(imagePaths, outputPath, options = {}) {
+  const { maxWidth = 1920, maxHeight = 1080 } = options;
+  const doc = new PDFDocument({ autoFirstPage: false, margin: 0 });
+  const { createWriteStream } = await import('fs');
+  const writeStream = createWriteStream(outputPath);
+  doc.pipe(writeStream);
+
+  for (let i = 0; i < imagePaths.length; i++) {
+    const buf = await fs.readFile(imagePaths[i]);
+    const meta = await sharp(buf).metadata();
+    let w = meta.width, h = meta.height;
+    if (w > maxWidth || h > maxHeight) {
+      const scale = Math.min(maxWidth / w, maxHeight / h);
+      w = Math.round(w * scale); h = Math.round(h * scale);
+    }
+    doc.addPage({ size: [w, h], margin: 0 });
+    doc.image(buf, 0, 0, { width: w, height: h });
+  }
+
+  doc.end();
+  await new Promise((resolve, reject) => { writeStream.on('finish', resolve); writeStream.on('error', reject); });
+  return { success: true, message: `PDF 已保存: ${outputPath}`, filePath: outputPath, pageCount: imagePaths.length };
+}
+
+async function imagesToPptx(imagePaths, outputPath) {
+  const PptxGenJS = (await import('pptxgenjs')).default;
+  const pptx = new PptxGenJS();
+  pptx.author = 'PanPan Image Generator';
+  pptx.title = 'Generated Presentation';
+
+  for (let i = 0; i < imagePaths.length; i++) {
+    const buf = await fs.readFile(imagePaths[i]);
+    const meta = await sharp(buf).metadata();
+    const imgAspect = meta.width / meta.height;
+
+    if (imgAspect > 1.5) pptx.defineLayout({ name: 'CUSTOM', width: 13.33, height: 7.5 });
+    else if (imgAspect < 0.67) pptx.defineLayout({ name: 'CUSTOM', width: 7.5, height: 13.33 });
+    else pptx.defineLayout({ name: 'CUSTOM', width: 10, height: 7.5 });
+    pptx.layout = 'CUSTOM';
+
+    const slide = pptx.addSlide();
+    const ext = path.extname(imagePaths[i]).toLowerCase().replace('.', '') || 'png';
+    slide.addImage({
+      data: `data:image/${ext === 'jpg' ? 'jpeg' : ext};base64,${buf.toString('base64')}`,
+      x: 0, y: 0, w: '100%', h: '100%',
+      sizing: { type: 'cover', w: '100%', h: '100%' }
+    });
+  }
+
+  await pptx.writeFile({ fileName: outputPath });
+  return { success: true, message: `PPTX 已保存: ${outputPath}`, filePath: outputPath, slideCount: imagePaths.length };
+}
+
+// ─── MCP 服务器 ───────────────────────────────────────────────────────────────
+
+const server = new Server(
+  { name: 'panpan-image-generator-mcp', version: '2.0.0' },
+  { capabilities: { tools: {} } }
+);
+
+server.setRequestHandler(InitializeRequestSchema, async () => ({
+  protocolVersion: '2024-11-05',
+  capabilities: { tools: {} },
+  serverInfo: { name: 'panpan-image-generator-mcp', version: '2.0.0' },
+}));
+
 server.setNotificationHandler(InitializedNotificationSchema, async () => {
   console.error('MCP 服务器初始化完成');
 });
 
-// 注册工具列表处理器
-server.setRequestHandler(ListToolsRequestSchema, async (request) => {
-  console.error('收到工具列表请求:', JSON.stringify(request, null, 2));
+// ─── 工具定义 ─────────────────────────────────────────────────────────────────
 
-  const tools = [
-    {
-      name: 'generate_image_nano',
-      description: '使用 nano-banana-pro 模型生成图像。🎨 提示词请用中文书写，充分发挥创意和设计感，自由表达视觉想象。适合创意设计、艺术创作等场景。默认 2K 分辨率。⚠️ 重要：提示词必须非常详细，包括：1) 画面整体布局和构图 2) 具体的视觉元素和图标 3) 详细的配色方案（色值） 4) 文字内容、字体样式、排版效果 5) 光影、渐变、阴影等细节效果 6) 设计风格（扁平化/3D/手绘等）。提示词越详细，生成效果越好！',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          prompt: {
-            type: 'string',
-            description: '图像生成的创意描述（必须用中文）。请非常详细地描述：画面布局、视觉元素、配色方案（含色值）、文字内容及样式、光影效果、设计风格等所有细节'
-          },
-          saveToFilePath: {
-            type: 'string',
-            description: '可选的保存文件路径（包含文件名和扩展名）'
-          },
-          image_size: {
-            type: 'string',
-            description: '图像分辨率：1K（标准）、2K（高清，默认）、4K（超高清）',
-            enum: ['1K', '2K', '4K'],
-            default: '2K'
-          },
-          aspect_ratio: {
-            type: 'string',
-            description: '宽高比，如 1:1、16:9、9:16、3:2、2:3、4:3、3:4、21:9 等',
-            enum: ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9']
-          }
-        },
-        required: ['prompt']
-      }
-    },
-    {
-      name: 'generate_image_seedream',
-      description: '使用 ByteDance Seedream 4.5 模型生成图像。🎨 字节跳动最新图像生成模型，效果优秀，速度快。提示词请用中文书写，注重设计感和视觉效果。⚠️ 重要：提示词必须非常详细，包括：1) 画面整体布局和构图 2) 具体的视觉元素和图标 3) 详细的配色方案（色值） 4) 文字内容、字体样式、排版效果 5) 光影、渐变、阴影等细节效果 6) 设计风格（扁平化/3D/手绘等）。提示词越详细，生成效果越好！',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          prompt: {
-            type: 'string',
-            description: '图像生成的创意描述（必须用中文）。请非常详细地描述：画面布局、视觉元素、配色方案（含色值）、文字内容及样式、光影效果、设计风格等所有细节'
-          },
-          saveToFilePath: {
-            type: 'string',
-            description: '可选的保存文件路径（包含文件名和扩展名）'
-          }
-        },
-        required: ['prompt']
-      }
-    },
+const MODEL_ENUM = [
+  'nanobananapro',
+  'nano-banana-pro',
+  'gemini-3-pro-image-preview',
+  'gemini-3-pro-image-preview-2k',
+  'gemini-3-pro-image-preview-4k',
+  'nanobanana2',
+  'gemini-flash',
+  'gemini-3.1-flash-image-preview',
+];
+
+const IMAGE_SIZE_ENUM = ['1K', '2K', '4K'];
+const ASPECT_RATIO_ENUM = ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'];
+
+const RESOLUTION_PROPS = {
+  image_size: {
+    type: 'string',
+    description: '图像分辨率预设：1K(1024x576)、2K(2048x1152，默认)、4K(3840x2160)',
+    enum: IMAGE_SIZE_ENUM,
+    default: '2K',
+  },
+  resolution: {
+    type: 'string',
+    description: '自定义分辨率，格式 WxH，如 1920x1080。优先级高于 image_size。',
+  },
+  aspect_ratio: {
+    type: 'string',
+    description: '宽高比',
+    enum: ASPECT_RATIO_ENUM,
+  },
+};
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
     {
       name: 'edit_image_nano',
-      description: '使用 nano-banana-pro 模型编辑现有图像。🎨 默认 2K 分辨率。⚠️ 重要：编辑提示词应直接说明要怎么改，不要描述当前图片内容！例如："把背景改成蓝色"、"把文字改成XXX"、"添加一个太阳在右上角"、"把人物的衣服改成红色"。直接说修改指令，模型会自动理解图片内容。',
+      description: '编辑图像（单张或批量）。支持全部四款生图模型，支持多图参考，支持指定分辨率和宽高比。',
       inputSchema: {
         type: 'object',
         properties: {
-          imagePath: {
-            type: 'string',
-            description: '要编辑的原始图像文件路径'
+          imagePath: { type: 'string', description: '【单张】要编辑的图像路径' },
+          editPrompt: { type: 'string', description: '【单张】编辑指令' },
+          requests: {
+            type: 'array',
+            description: '【批量】批量编辑请求列表',
+            items: {
+              type: 'object',
+              properties: {
+                imagePath: { type: 'string' },
+                editPrompt: { type: 'string' },
+                saveToFilePath: { type: 'string' },
+                referenceImages: { type: 'array', items: { type: 'string' } },
+              },
+              required: ['imagePath', 'editPrompt'],
+            },
           },
-          editPrompt: {
-            type: 'string',
-            description: '编辑指令（中文）。直接说要怎么改，不要描述当前图片内容！例如："把背景改成蓝色"、"把文字改成XXX"、"添加一个太阳在右上角"'
-          },
-          saveToFilePath: {
-            type: 'string',
-            description: '可选的保存文件路径（包含文件名和扩展名）'
-          },
-          image_size: {
-            type: 'string',
-            description: '图像分辨率：1K（标准）、2K（高清，默认）、4K（超高清）',
-            enum: ['1K', '2K', '4K'],
-            default: '2K'
-          },
-          aspect_ratio: {
-            type: 'string',
-            description: '宽高比，如 1:1、16:9、9:16、3:2、2:3、4:3、3:4、21:9 等',
-            enum: ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9']
-          }
+          concurrency: { type: 'number', description: '并发数，默认 10' },
+          referenceImages: { type: 'array', description: '【单张】参考图片路径数组', items: { type: 'string' } },
+          saveToFilePath: { type: 'string', description: '保存路径' },
+          model: { type: 'string', description: '模型选择，默认 nanobananapro', enum: MODEL_ENUM },
+          ...RESOLUTION_PROPS,
         },
-        required: ['imagePath', 'editPrompt']
-      }
+      },
     },
     {
-      name: 'edit_image_seedream',
-      description: '使用 ByteDance Seedream 4.5 模型编辑现有图像。🎨 编辑提示词应直接说明要怎么改，不要描述当前图片内容！例如："把背景改成蓝色"、"把文字改成XXX"、"添加一个太阳在右上角"。直接说修改指令，模型会自动理解图片内容。',
+      name: 'generate_image_with_shared_context',
+      description: '🎯【推荐】共享上下文批量生图（保持风格一致性）。适合 PPT、教程、卡片组等系列图片。支持全部四款模型，支持指定分辨率。',
       inputSchema: {
         type: 'object',
         properties: {
-          imagePath: {
+          styleContext: {
             type: 'string',
-            description: '要编辑的原始图像文件路径'
+            description: '【必填】全局风格上下文（系列名称、背景色、强调色、排版规范等）',
           },
-          editPrompt: {
-            type: 'string',
-            description: '编辑指令（中文）。直接说要怎么改，不要描述当前图片内容！例如："把背景改成蓝色"、"把文字改成XXX"'
-          },
-          saveToFilePath: {
-            type: 'string',
-            description: '可选的保存文件路径（包含文件名和扩展名）'
-          }
-        },
-        required: ['imagePath', 'editPrompt']
-      }
-    },
-    {
-      name: 'generate_image_glm',
-      description: '使用智谱 GLM-Image 模型生成图像。🎨 智谱 AI 图像生成模型，适合科普教育、插图设计等场景。支持中文提示词，效果稳定。默认 1280x1280 高清尺寸，无水印。',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          prompt: {
-            type: 'string',
-            description: '图像生成的描述（中文）。详细描述画面内容、风格、元素等'
-          },
-          saveToFilePath: {
-            type: 'string',
-            description: '可选的保存文件路径（包含文件名和扩展名）'
-          },
-          size: {
-            type: 'string',
-            description: '图像尺寸，默认 1280x1280。推荐枚举值：1280x1280(默认), 1568x1056, 1056x1568, 1472x1088, 1088x1472, 1728x960, 960x1728',
-            enum: ['1280x1280', '1568x1056', '1056x1568', '1472x1088', '1088x1472', '1728x960', '960x1728', '1024x1024', '768x1024', '1024x768'],
-            default: '1280x1280'
-          }
-        },
-        required: ['prompt']
-      }
-    },
-    {
-      name: 'generate_image_glm_batch',
-      description: '使用智谱 GLM-Image 模型批量生成多张图像。🎨 支持并发执行，适合批量生成科普插图、教育素材等场景。默认 1280x1280 高清尺寸，无水印。',
-      inputSchema: {
-        type: 'object',
-        properties: {
           requests: {
             type: 'array',
             description: '批量生成请求列表',
             items: {
               type: 'object',
               properties: {
-                prompt: { type: 'string', description: '图像生成的描述（中文）' },
-                saveToFilePath: { type: 'string', description: '可选的保存路径' }
+                prompt: { type: 'string' },
+                pageNumber: { type: 'number' },
+                saveToFilePath: { type: 'string' },
               },
-              required: ['prompt']
-            }
+              required: ['prompt', 'pageNumber'],
+            },
           },
-          concurrency: {
-            type: 'number',
-            description: '并发数量，默认 3'
-          },
-          size: {
-            type: 'string',
-            description: '图像尺寸，默认 1280x1280。推荐枚举值：1280x1280(默认), 1568x1056, 1056x1568, 1472x1088, 1088x1472, 1728x960, 960x1728',
-            enum: ['1280x1280', '1568x1056', '1056x1568', '1472x1088', '1088x1472', '1728x960', '960x1728', '1024x1024', '768x1024', '1024x768'],
-            default: '1280x1280'
-          }
+          concurrency: { type: 'number', description: '并发数，默认 10' },
+          model: { type: 'string', description: '模型选择，默认 nanobananapro', enum: MODEL_ENUM },
+          ...RESOLUTION_PROPS,
         },
-        required: ['requests']
-      }
+        required: ['styleContext', 'requests'],
+      },
     },
     {
       name: 'generate_image_batch',
-      description: '批量生成多张图像，支持并发执行。🎨 提示词请用中文书写，适合需要生成多个创意作品的场景。可选择使用 nano-banana-pro (Google) 或 seedream-4.5 (ByteDance) 模型。nano-banana-pro 默认 2K 分辨率，支持 1K/2K/4K。',
+      description: '批量生图（单张或多张，高并发）。支持全部四款模型：nanobananapro / gemini-3-pro-image-preview（高质量）、gemini-3-pro-image-preview-2k（2K）、gemini-3-pro-image-preview-4k（4K）、nanobanana2 / gemini-flash（快速）。支持指定分辨率和宽高比。\n\n📁 路径规则：① 每条请求可单独指定 saveToFilePath；② 可用 outputDir 统一指定目录（默认当前工作目录）；③ 写入失败时自动 fallback 到 MCP 服务器目录。',
       inputSchema: {
         type: 'object',
         properties: {
           requests: {
             type: 'array',
-            description: '批量生成请求列表，每项包含创意描述（中文）和可选的保存路径',
+            description: '生成请求列表',
             items: {
               type: 'object',
               properties: {
-                prompt: { type: 'string', description: '图像生成的创意描述（中文）' },
-                saveToFilePath: { type: 'string', description: '可选的保存路径' }
+                prompt: { type: 'string', description: '图像描述（中文）' },
+                saveToFilePath: { type: 'string', description: '可选，指定完整保存路径（含文件名）' },
               },
-              required: ['prompt']
-            }
+              required: ['prompt'],
+            },
           },
-          concurrency: {
-            type: 'number',
-            description: '并发数量，默认 3'
+          outputDir: {
+            type: 'string',
+            description: '可选，统一指定输出目录（不含文件名）。未指定时默认为当前工作目录。单条请求的 saveToFilePath 优先级更高。',
           },
+          concurrency: { type: 'number', description: '并发数，默认 10' },
           model: {
             type: 'string',
-            description: '使用的模型：nano-banana-pro (Google高质量) 或 seedream-4.5 (ByteDance快速)，默认 nano-banana-pro',
-            enum: ['nano-banana-pro', 'seedream-4.5']
+            description: '模型选择：nanobananapro（高质量，默认）、gemini-3-pro-image-preview-2k（Pro 2K）、gemini-3-pro-image-preview-4k（Pro 4K）、nanobanana2（快速）',
+            enum: MODEL_ENUM,
           },
-          image_size: {
-            type: 'string',
-            description: '图像分辨率（仅 nano-banana-pro 支持）：1K（标准）、2K（高清，默认）、4K（超高清）',
-            enum: ['1K', '2K', '4K'],
-            default: '2K'
-          },
-          aspect_ratio: {
-            type: 'string',
-            description: '宽高比（仅 nano-banana-pro 支持），如 1:1、16:9、9:16 等',
-            enum: ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9']
-          }
+          ...RESOLUTION_PROPS,
         },
-        required: ['requests']
-      }
+        required: ['requests'],
+      },
     },
     {
       name: 'images_to_pdf',
-      description: '将多张图片转换为 PDF 文件。📄 每页一张图片，页面尺寸完全匹配图片比例，无空白，完美填充。',
+      description: '将多张图片转换为 PDF（每页一张，完美填充无空白）。',
       inputSchema: {
         type: 'object',
         properties: {
-          imagePaths: {
-            type: 'array',
-            description: '图片文件路径列表，按顺序排列',
-            items: { type: 'string' }
-          },
-          outputPath: {
-            type: 'string',
-            description: 'PDF 输出文件路径（包含 .pdf 扩展名）'
-          }
+          imagePaths: { type: 'array', items: { type: 'string' } },
+          outputPath: { type: 'string' },
         },
-        required: ['imagePaths', 'outputPath']
-      }
+        required: ['imagePaths', 'outputPath'],
+      },
     },
     {
       name: 'images_to_pptx',
-      description: '将多张图片转换为 PowerPoint (PPTX) 文件。📊 每张幻灯片一张图片，图片填满整个幻灯片，适合演示展示。',
+      description: '将多张图片转换为 PowerPoint (PPTX) 文件。',
       inputSchema: {
         type: 'object',
         properties: {
-          imagePaths: {
-            type: 'array',
-            description: '图片文件路径列表，按顺序排列',
-            items: { type: 'string' }
-          },
-          outputPath: {
-            type: 'string',
-            description: 'PPTX 输出文件路径（包含 .pptx 扩展名）'
-          }
+          imagePaths: { type: 'array', items: { type: 'string' } },
+          outputPath: { type: 'string' },
         },
-        required: ['imagePaths', 'outputPath']
-      }
-    }
-  ];
+        required: ['imagePaths', 'outputPath'],
+      },
+    },
+  ],
+}));
 
-  const response = { tools };
-  console.error('发送工具列表响应:', JSON.stringify(response, null, 2));
-  return response;
-});
+// ─── 工具调用处理 ─────────────────────────────────────────────────────────────
 
-// 注册工具调用处理器
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
     switch (name) {
-      case 'generate_image_nano': {
-        const { prompt, saveToFilePath, image_size, aspect_ratio } = args;
-        
-        if (!prompt) {
-          throw new Error('缺少必需的参数: prompt');
-        }
-
-        // 构建 image_config，默认 2K
-        const imageConfig = { image_size: image_size || '2K' };
-        if (aspect_ratio) imageConfig.aspect_ratio = aspect_ratio;
-
-        const result = await generateImage(prompt, saveToFilePath, API_CONFIG.modelNanoBanana, imageConfig);
-        
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2)
-            }
-          ]
-        };
-      }
-
-      case 'generate_image_seedream': {
-        const { prompt, saveToFilePath } = args;
-        
-        if (!prompt) {
-          throw new Error('缺少必需的参数: prompt');
-        }
-
-        const result = await generateImage(prompt, saveToFilePath, API_CONFIG.modelSeedream);
-        
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2)
-            }
-          ]
-        };
-      }
-
       case 'edit_image_nano': {
-        const { imagePath, editPrompt, saveToFilePath, image_size, aspect_ratio } = args;
-        
-        if (!imagePath || !editPrompt) {
-          throw new Error('缺少必需的参数: imagePath 或 editPrompt');
+        const { imagePath, editPrompt, saveToFilePath, image_size, resolution, aspect_ratio, referenceImages, requests, concurrency, model, outputDir } = args;
+        const selectedModel = resolveModel(model || API_CONFIG.modelNanoBanana);
+        const imageConfig = { image_size: image_size || '2K', resolution, aspect_ratio };
+
+        const prevOutputDir = API_CONFIG.outputDir;
+        if (outputDir) {
+          API_CONFIG.outputDir = outputDir;
+          console.error(`[edit_image_nano] outputDir 覆盖为: ${outputDir}`);
         }
 
-        // 构建 image_config，默认 2K
-        const imageConfig = { image_size: image_size || '2K' };
-        if (aspect_ratio) imageConfig.aspect_ratio = aspect_ratio;
-
-        const result = await editImage(imagePath, editPrompt, saveToFilePath, API_CONFIG.modelNanoBanana, imageConfig);
-        
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2)
-            }
-          ]
-        };
+        let editResult;
+        try {
+          if (requests && Array.isArray(requests) && requests.length > 0) {
+            const results = await editImageBatch(requests, concurrency || 10, selectedModel, imageConfig);
+            editResult = { content: [{ type: 'text', text: JSON.stringify({ success: results.every(r => r.success), results }, null, 2) }] };
+          } else {
+            if (!imagePath || !editPrompt) throw new Error('缺少 imagePath 或 editPrompt');
+            const result = await editImage(imagePath, editPrompt, saveToFilePath, selectedModel, imageConfig, referenceImages || []);
+            editResult = { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+          }
+        } finally {
+          API_CONFIG.outputDir = prevOutputDir;
+        }
+        return editResult;
       }
 
-      case 'edit_image_seedream': {
-        const { imagePath, editPrompt, saveToFilePath } = args;
-        
-        if (!imagePath || !editPrompt) {
-          throw new Error('缺少必需的参数: imagePath 或 editPrompt');
+      case 'generate_image_with_shared_context': {
+        const { styleContext, requests, concurrency, image_size, resolution, aspect_ratio, model, outputDir } = args;
+        if (!styleContext) throw new Error('缺少 styleContext');
+        if (!requests || !Array.isArray(requests) || requests.length === 0) throw new Error('缺少 requests');
+
+        const selectedModel = resolveModel(model || API_CONFIG.modelNanoBanana);
+        const imageConfig = { image_size: image_size || '2K', resolution, aspect_ratio };
+
+        const prevOutputDir = API_CONFIG.outputDir;
+        if (outputDir) {
+          API_CONFIG.outputDir = outputDir;
+          console.error(`[shared_context] outputDir 覆盖为: ${outputDir}`);
         }
 
-        const result = await editImage(imagePath, editPrompt, saveToFilePath, API_CONFIG.modelSeedream);
-        
+        let results;
+        try {
+          results = await generateImageWithSharedContext(styleContext, requests, concurrency || 10, selectedModel, imageConfig);
+        } finally {
+          API_CONFIG.outputDir = prevOutputDir;
+        }
         return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2)
-            }
-          ]
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: results.every(r => r.success),
+              totalPages: requests.length,
+              successCount: results.filter(r => r.success).length,
+              failedCount: results.filter(r => !r.success).length,
+              results,
+            }, null, 2),
+          }],
         };
       }
 
       case 'generate_image_batch': {
-        const { requests, concurrency, model, image_size, aspect_ratio } = args;
-        if (!requests || !Array.isArray(requests) || requests.length === 0) {
-          throw new Error('缺少必需的参数: requests (数组)');
+        const { requests, concurrency, model, image_size, resolution, aspect_ratio, outputDir } = args;
+        if (!requests || !Array.isArray(requests) || requests.length === 0) throw new Error('缺少 requests');
+
+        const selectedModel = resolveModel(model || API_CONFIG.modelNanoBanana);
+        const imageConfig = { image_size: image_size || '2K', resolution, aspect_ratio };
+
+        // 若传了 outputDir，临时覆盖 API_CONFIG.outputDir（仅本次调用）
+        const prevOutputDir = API_CONFIG.outputDir;
+        if (outputDir) {
+          API_CONFIG.outputDir = outputDir;
+          console.error(`[generate_image_batch] outputDir 覆盖为: ${outputDir}`);
         }
 
-        const selectedModel = model === 'seedream-4.5' ? API_CONFIG.modelSeedream : API_CONFIG.modelNanoBanana;
-        
-        // 构建 image_config（仅 nano-banana-pro 支持），默认 2K
-        let imageConfig = null;
-        if (selectedModel === API_CONFIG.modelNanoBanana) {
-          imageConfig = { image_size: image_size || '2K' };
-          if (aspect_ratio) imageConfig.aspect_ratio = aspect_ratio;
-        }
-        
-        const results = await generateImageBatch(requests, concurrency || 3, selectedModel, imageConfig);
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                success: results.every(r => r.success),
-                results
-              }, null, 2)
-            }
-          ]
-        };
-      }
-
-      case 'generate_image_glm': {
-        const { prompt, saveToFilePath, size } = args;
-        
-        if (!prompt) {
-          throw new Error('缺少必需的参数: prompt');
+        let results;
+        try {
+          results = await generateImageBatch(requests, concurrency || 10, selectedModel, imageConfig);
+        } finally {
+          API_CONFIG.outputDir = prevOutputDir;
         }
 
-        const result = await generateImageGlm(prompt, saveToFilePath, size || '1280x1280');
-        
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2)
-            }
-          ]
-        };
-      }
-
-      case 'generate_image_glm_batch': {
-        const { requests, concurrency, size } = args;
-        if (!requests || !Array.isArray(requests) || requests.length === 0) {
-          throw new Error('缺少必需的参数: requests (数组)');
-        }
-
-        const results = await generateImageGlmBatch(requests, concurrency || 3, size || '1280x1280');
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                success: results.every(r => r.success),
-                results
-              }, null, 2)
-            }
-          ]
-        };
+        return { content: [{ type: 'text', text: JSON.stringify({ success: results.every(r => r.success), results }, null, 2) }] };
       }
 
       case 'images_to_pdf': {
         const { imagePaths, outputPath } = args;
-        
-        if (!imagePaths || !Array.isArray(imagePaths) || imagePaths.length === 0) {
-          throw new Error('缺少必需的参数: imagePaths (图片路径数组)');
-        }
-        if (!outputPath) {
-          throw new Error('缺少必需的参数: outputPath (PDF 输出路径)');
-        }
-
-        const result = await imagesToPdf(imagePaths, outputPath);
-        
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2)
-            }
-          ]
-        };
+        if (!imagePaths || !Array.isArray(imagePaths) || imagePaths.length === 0) throw new Error('缺少 imagePaths');
+        if (!outputPath) throw new Error('缺少 outputPath');
+        return { content: [{ type: 'text', text: JSON.stringify(await imagesToPdf(imagePaths, outputPath), null, 2) }] };
       }
 
       case 'images_to_pptx': {
         const { imagePaths, outputPath } = args;
-        
-        if (!imagePaths || !Array.isArray(imagePaths) || imagePaths.length === 0) {
-          throw new Error('缺少必需的参数: imagePaths (图片路径数组)');
-        }
-        if (!outputPath) {
-          throw new Error('缺少必需的参数: outputPath (PPTX 输出路径)');
-        }
-
-        const result = await imagesToPptx(imagePaths, outputPath);
-        
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2)
-            }
-          ]
-        };
+        if (!imagePaths || !Array.isArray(imagePaths) || imagePaths.length === 0) throw new Error('缺少 imagePaths');
+        if (!outputPath) throw new Error('缺少 outputPath');
+        return { content: [{ type: 'text', text: JSON.stringify(await imagesToPptx(imagePaths, outputPath), null, 2) }] };
       }
 
       default:
-        throw new Error(`未知的工具: ${name}`);
+        throw new Error(`未知工具: ${name}`);
     }
   } catch (error) {
     console.error(`工具 ${name} 执行失败:`, error);
     return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify({
-            success: false,
-            error: error.message,
-            tool: name
-          }, null, 2)
-        }
-      ],
-      isError: true
+      content: [{ type: 'text', text: JSON.stringify({ success: false, error: error.message, tool: name }, null, 2) }],
+      isError: true,
     };
   }
 });
 
-// 启动服务器
+// ─── 启动 ─────────────────────────────────────────────────────────────────────
+
 async function main() {
-  try {
-    console.error('启动自定义 Gemini MCP 服务器...');
-    console.error(`Node.js 版本: ${process.version}`);
-    console.error(`工作目录: ${process.cwd()}`);
-    console.error(`API 配置: ${JSON.stringify({
-      apiBase: API_CONFIG.apiBase,
-      modelNanoBanana: API_CONFIG.modelNanoBanana,
-      modelGeminiFlash: API_CONFIG.modelGeminiFlash,
-      outputDir: API_CONFIG.outputDir,
-      hasApiKey: !!API_CONFIG.apiKey
-    }, null, 2)}`);
+  console.error('启动 PanPan Image Generator MCP v2.0...');
+  console.error(`Node.js: ${process.version}`);
+  console.error(`API Base: ${API_CONFIG.apiBase}`);
+  console.error(`Chat URL: ${API_CONFIG.chatApiUrl}`);
+  console.error(`默认模型 (Pro): ${API_CONFIG.modelNanoBanana}`);
+  console.error(`默认模型 (Flash): ${API_CONFIG.modelGeminiFlash}`);
+  console.error(`API Key 已设置: ${!!API_CONFIG.apiKey}`);
 
-    await ensureOutputDir();
-    console.error('输出目录已确保存在');
+  await ensureOutputDir();
 
-    const transport = new StdioServerTransport();
-    console.error('创建 STDIO 传输层');
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('MCP 服务器已启动');
 
-    await server.connect(transport);
-    console.error('自定义 Gemini MCP 服务器已启动并连接');
-
-    // 添加进程退出处理
-    process.on('SIGINT', () => {
-      console.error('收到 SIGINT，正在关闭服务器...');
-      process.exit(0);
-    });
-
-    process.on('SIGTERM', () => {
-      console.error('收到 SIGTERM，正在关闭服务器...');
-      process.exit(0);
-    });
-
-  } catch (error) {
-    console.error('启动过程中发生错误:', error);
-    console.error('错误堆栈:', error.stack);
-    throw error;
-  }
+  process.on('SIGINT', () => { console.error('收到 SIGINT，关闭...'); process.exit(0); });
+  process.on('SIGTERM', () => { console.error('收到 SIGTERM，关闭...'); process.exit(0); });
 }
 
-main().catch((error) => {
-  console.error('启动服务器失败:', error);
-  console.error('错误详情:', error.stack);
+main().catch((e) => {
+  console.error('启动失败:', e);
   process.exit(1);
 });

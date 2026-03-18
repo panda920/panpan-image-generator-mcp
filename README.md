@@ -5,63 +5,68 @@
 <h1 align="center">PanPan Image Generator MCP</h1>
 
 <p align="center">
-  <strong>AI 驱动的多模型图像生成 MCP 服务器</strong>
+  <strong>AI-powered image generation & editing MCP server for Claude Code</strong>
 </p>
 
 <p align="center">
-  <a href="#功能特性">功能特性</a> •
-  <a href="#支持的模型">支持的模型</a> •
-  <a href="#快速开始">快速开始</a> •
-  <a href="#使用示例">使用示例</a> •
-  <a href="#联系作者">联系作者</a>
+  <a href="#features">Features</a> •
+  <a href="#supported-models">Models</a> •
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#tools">Tools</a> •
+  <a href="#examples">Examples</a>
 </p>
 
 ---
 
-## ✨ 功能特性
+## Features
 
-- 🎨 **多模型支持** - 集成 Google Gemini、ByteDance Seedream、智谱 GLM 等顶级 AI 图像模型
-- 🖼️ **高清分辨率** - 支持 1K / 2K / 4K 多种分辨率输出
-- ✏️ **图像编辑** - 基于已有图像进行智能修改
-- 📦 **批量生成** - 并发处理多个图像生成任务
-- 📄 **格式转换** - 支持图片转 PDF / PPTX
-
----
-
-## 🎯 支持的模型
-
-| 模型 | 提供商 | 特点 |
-|------|--------|------|
-| **Nano Banana Pro** | Google Gemini | 高质量生成，支持 1K/2K/4K |
-| **Seedream 4.5** | ByteDance | 快速生成，效果优秀 |
-| **GLM-Image** | 智谱 AI | 中文优化，理解力强 |
+- **Multi-model support** — Gemini Pro Image Preview (1K/2K/4K) and Gemini Flash Image Preview
+- **Image editing** — Edit existing images with text instructions, supports multi-image reference
+- **Batch generation** — High-concurrency worker pool for parallel image generation
+- **Shared context** — Generate series of images with consistent style (great for slides, tutorials, card sets)
+- **Resolution control** — 1K / 2K / 4K presets or custom WxH, plus aspect ratio selection
+- **Format conversion** — Convert images to PDF or PowerPoint (PPTX)
+- **Smart file handling** — Auto-fallback output directory, customizable per-request save paths
 
 ---
 
-## 🖼️ 生成效果展示
+## Supported Models
+
+| Model ID | Alias | Quality |
+|----------|-------|---------|
+| `gemini-3-pro-image-preview` | `nanobananapro` | High quality, 1K |
+| `gemini-3-pro-image-preview-2k` | — | High quality, 2K |
+| `gemini-3-pro-image-preview-4k` | — | High quality, 4K |
+| `gemini-3.1-flash-image-preview` | `nanobanana2`, `gemini-flash` | Fast |
+
+All models are accessed through any OpenAI-compatible API endpoint that supports Gemini image generation.
+
+---
+
+## Demo
 
 <table>
   <tr>
     <td align="center">
       <img src="assets/demo-art.png" width="300"><br>
-      <sub>🎨 艺术插画风格</sub>
+      <sub>Art illustration</sub>
     </td>
     <td align="center">
       <img src="assets/demo-cyberpunk.png" width="300"><br>
-      <sub>🌃 赛博朋克风格</sub>
+      <sub>Cyberpunk</sub>
     </td>
     <td align="center">
       <img src="assets/demo-chinese.png" width="300"><br>
-      <sub>🏔️ 中国水墨风格</sub>
+      <sub>Chinese ink painting</sub>
     </td>
   </tr>
 </table>
 
 ---
 
-## 🚀 快速开始
+## Quick Start
 
-### 安装
+### Install
 
 ```bash
 git clone https://github.com/panda920/panpan-image-generator-mcp.git
@@ -69,28 +74,24 @@ cd panpan-image-generator-mcp
 npm install
 ```
 
-### 配置
+### Configure
 
-复制环境变量示例文件并填入你的 API Key：
+Copy the example env file and fill in your API key:
 
 ```bash
 cp .env.example .env
 ```
 
-编辑 `.env` 文件：
+Edit `.env`:
 
 ```env
-# OpenRouter API 配置 (用于 Gemini 和 Seedream 模型)
-GEMINI_API_KEY=your_openrouter_api_key_here
+GEMINI_API_KEY=your_api_key_here
 GEMINI_API_BASE=https://openrouter.ai/api/v1
-
-# 智谱 API 配置 (用于 GLM-Image 模型)
-ZHIPU_API_KEY=your_zhipu_api_key_here
 ```
 
-### 在 Claude Code 中使用
+### Use with Claude Code
 
-在 `~/.claude.json` 中添加以下配置：
+Add to `~/.claude.json`:
 
 ```json
 {
@@ -101,8 +102,7 @@ ZHIPU_API_KEY=your_zhipu_api_key_here
       "args": ["/path/to/panpan-image-generator-mcp/panpan-image-generator-mcp-server.js"],
       "env": {
         "GEMINI_API_KEY": "your_api_key",
-        "GEMINI_API_BASE": "https://openrouter.ai/api/v1",
-        "ZHIPU_API_KEY": "your_zhipu_api_key"
+        "GEMINI_API_BASE": "https://openrouter.ai/api/v1"
       }
     }
   }
@@ -111,70 +111,67 @@ ZHIPU_API_KEY=your_zhipu_api_key_here
 
 ---
 
-## 🛠️ 可用工具
+## Tools
 
-### 图像生成
+### Image Generation
 
-| 工具 | 说明 |
-|------|------|
-| `generate_image_nano` | 使用 Nano Banana Pro 生成高质量图像 |
-| `generate_image_seedream` | 使用 Seedream 4.5 快速生成图像 |
-| `generate_image_glm` | 使用 GLM-Image 生成图像（中文优化） |
-| `generate_image_batch` | 批量并发生成多张图像 |
-| `generate_image_glm_batch` | 批量生成 GLM 图像 |
+| Tool | Description |
+|------|-------------|
+| `generate_image_batch` | Generate one or more images with high concurrency. Supports all 4 models, custom resolution and aspect ratio. |
+| `generate_image_with_shared_context` | Batch generate images with shared style context for visual consistency. Ideal for slides, tutorials, card sets. |
 
-### 图像编辑
+### Image Editing
 
-| 工具 | 说明 |
-|------|------|
-| `edit_image_nano` | 使用 Nano Banana Pro 编辑图像 |
-| `edit_image_seedream` | 使用 Seedream 4.5 编辑图像 |
+| Tool | Description |
+|------|-------------|
+| `edit_image_nano` | Edit images (single or batch). Supports all 4 models, multi-image reference, custom resolution and aspect ratio. |
 
-### 格式转换
+### Format Conversion
 
-| 工具 | 说明 |
-|------|------|
-| `images_to_pdf` | 将多张图片转换为 PDF 文档 |
-| `images_to_pptx` | 将多张图片转换为 PowerPoint 演示文稿 |
+| Tool | Description |
+|------|-------------|
+| `images_to_pdf` | Convert multiple images to a PDF document (one image per page, full bleed). |
+| `images_to_pptx` | Convert multiple images to a PowerPoint presentation. |
 
 ---
 
-## 💡 使用示例
+## Examples
 
-在 Claude Code 中直接对话即可：
+In Claude Code, just ask naturally:
 
 ```
-用户：生成一张赛博朋克风格的城市夜景图
+Generate a cyberpunk cityscape at night in 4K
 
-用户：帮我把这张图的背景改成蓝色
+Edit this image: change the background to blue
 
-用户：批量生成5张不同风格的猫咪插画
+Batch generate 5 cat illustrations in different styles
 
-用户：把这些图片转成PDF文档
+Create a 10-slide presentation with consistent branding, then export to PPTX
 ```
 
 ---
 
-## 📋 环境要求
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GEMINI_API_KEY` | — | API key (required) |
+| `GEMINI_API_BASE` | `https://openrouter.ai/api/v1` | OpenAI-compatible API base URL |
+| `GEMINI_MODEL` | `gemini-3-pro-image-preview` | Default Pro model |
+| `GEMINI_FLASH_MODEL` | `gemini-3.1-flash-image-preview` | Default Flash model |
+| `OUTPUT_DIR` | Current working directory | Default output directory |
+
+---
+
+## Requirements
 
 - Node.js >= 18.0.0
-- npm 或 yarn
 
 ---
 
-## 📄 许可证
+## License
 
 MIT License
-
----
-
-## 📬 联系作者
-
-如有问题或建议，欢迎添加微信交流：
-
-<p align="center">
-  <img src="assets/wechat.jpg" width="200" alt="微信联系方式">
-</p>
 
 ---
 
